@@ -2,7 +2,7 @@
 
 Find Homebrew packages you never use.
 
-Cross-references `brew leaves` with your zsh history to show when each package was last used, how many times, and which ones are gathering dust.
+Cross-references `brew leaves` with your shell history (bash or zsh) to show when each package was last used, how many times, and which ones are gathering dust.
 
 ## Install
 
@@ -41,7 +41,7 @@ The tool also resolves binary aliases (e.g. `ripgrep` → `rg`) so usage is dete
 ## Requirements
 
 - macOS with [Homebrew](https://brew.sh)
-- zsh (uses zsh history format)
+- bash 4+ or zsh (macOS ships bash 3.2 — run `brew install bash` for a modern version)
 - Python 3 (for parsing `brew info` JSON)
 
 ## License
