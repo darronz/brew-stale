@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # brew-stale
-# Cross-references `brew leaves` with shell history to find when each tool was last used.
+# Cross-references `brew leaves` and installed casks with shell history
+# to find when each package was last used.
 # Supports both bash and zsh history formats.
 #
 # Usage:
@@ -47,17 +48,44 @@ else
     RED='' YELLOW='' GREEN='' DIM='' BOLD='' RESET=''
 fi
 
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+PROGRESS_LINES=0
+progress() {
+    echo "${DIM}$*${RESET}" >&2
+    (( PROGRESS_LINES++ )) || true
+}
+
+format_size() {
+    local kb=$1
+    if (( kb >= 1048576 )); then
+        local whole=$(( kb / 1048576 ))
+        local frac=$(( (kb % 1048576) * 10 / 1048576 ))
+        printf "%d.%dG" "$whole" "$frac"
+    elif (( kb >= 1024 )); then
+        local whole=$(( kb / 1024 ))
+        local frac=$(( (kb % 1024) * 10 / 1024 ))
+        printf "%d.%dM" "$whole" "$frac"
+    else
+        printf "%dK" "$kb"
+    fi
+}
+
+ts_to_date() {
+    date -r "$1" "+%Y-%m-%d" 2>/dev/null || date -d "@$1" "+%Y-%m-%d" 2>/dev/null || echo "unknown"
+}
+
 # ─── Usage ───────────────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
 
-Cross-references brew leaves with shell history to show when each tool was last used.
-Supports both bash and zsh history formats.
+Cross-references brew leaves and casks with shell history to show when each
+package was last used. Supports both bash and zsh history formats.
+Also detects brew services and uses macOS metadata for cask app last-used dates.
 
 Options:
   --stale N    Only show packages not used in the last N days
-  --csv        Output as CSV (package,last_used_date,days_ago,times_used)
+  --csv        Output as CSV
   --history F  Path to history file (default: \$HISTFILE, ~/.zsh_history, or ~/.bash_history)
   --help       Show this help message
 EOF
@@ -94,67 +122,125 @@ elif head -5 "$HISTORY_FILE" | grep -q '^#[0-9]' 2>/dev/null; then
     HISTORY_FORMAT="bash"
 fi
 
-# ─── Get installed packages ─────────────────────────────────────────────────
-echo "${DIM}Gathering brew leaves...${RESET}" >&2
-packages=($(brew leaves))
+NOW=$(date +%s)
 
-if [[ ${#packages[@]} -eq 0 ]]; then
-    echo "No packages found from brew leaves."
-    exit 0
+# ─── Detect brew services ───────────────────────────────────────────────────
+progress "Detecting brew services..."
+declare -A svc_status
+while read -r svc_name svc_state _rest; do
+    [[ "$svc_name" == "Name" ]] && continue
+    [[ -z "$svc_name" ]] && continue
+    svc_status[$svc_name]="$svc_state"
+done < <(brew services list 2>/dev/null || true)
+
+# ─── Get formula packages ───────────────────────────────────────────────────
+progress "Gathering brew leaves..."
+packages=($(brew leaves))
+progress "Found ${#packages[@]} formulae. Resolving details..."
+
+# ─── Fetch formula info (descriptions + install dates) ──────────────────────
+progress "Fetching formula info..."
+declare -A pkg_descs
+declare -A pkg_install_ts
+
+if [[ ${#packages[@]} -gt 0 ]]; then
+    while IFS='|' read -r name desc install_time; do
+        pkg_descs[$name]="$desc"
+        pkg_install_ts[$name]="$install_time"
+    done < <(brew info --json=v2 "${packages[@]}" 2>/dev/null \
+        | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for f in d['formulae']:
+    ts = 0
+    if f.get('installed'):
+        times = [i.get('time', 0) or 0 for i in f['installed']]
+        ts = max(times) if times else 0
+    print(f['full_name'] + '|' + (f['desc'] or '') + '|' + str(int(ts)))
+")
 fi
 
-echo "${DIM}Found ${#packages[@]} packages. Resolving binary names...${RESET}" >&2
-
-# ─── Fetch package descriptions ────────────────────────────────────────────
-echo "${DIM}Fetching package descriptions...${RESET}" >&2
-declare -A pkg_descs
-while IFS='|' read -r name desc; do
-    pkg_descs[$name]="$desc"
-done < <(brew info --json=v2 "${packages[@]}" 2>/dev/null \
-    | python3 -c "import sys,json; d=json.load(sys.stdin); [print(f['full_name']+'|'+(f['desc'] or '')) for f in d['formulae']]")
-
-# ─── Resolve binary aliases ─────────────────────────────────────────────────
-# Some packages install binaries with different names (e.g. "ripgrep" -> "rg").
+# ─── Resolve binary aliases + measure formula sizes ─────────────────────────
 declare -A pkg_aliases
+declare -A pkg_sizes
 
 for pkg in "${packages[@]}"; do
-    cellar_bin="/opt/homebrew/Cellar/${pkg}"
-    if [[ ! -d "$cellar_bin" ]]; then
-        cellar_bin="/usr/local/Cellar/${pkg}"
+    cellar_dir="/opt/homebrew/Cellar/${pkg}"
+    if [[ ! -d "$cellar_dir" ]]; then
+        cellar_dir="/usr/local/Cellar/${pkg}"
     fi
-    if [[ -d "$cellar_bin" ]]; then
-        latest=$(ls -1 "$cellar_bin" 2>/dev/null | tail -1)
-        if [[ -n "$latest" && -d "$cellar_bin/$latest/bin" ]]; then
-            bin_aliases=()
-            for binary in "$cellar_bin/$latest/bin/"*; do
-                bin_name=$(basename "$binary")
-                if [[ "$bin_name" != "$pkg" ]]; then
-                    bin_aliases+=("$bin_name")
+    if [[ -d "$cellar_dir" ]]; then
+        latest=$(ls -1 "$cellar_dir" 2>/dev/null | tail -1)
+        if [[ -n "$latest" ]]; then
+            pkg_sizes[$pkg]=$(du -sk "$cellar_dir/$latest" 2>/dev/null | cut -f1)
+
+            # Install date fallback from filesystem birth time
+            if [[ "${pkg_install_ts[$pkg]:-0}" == "0" ]]; then
+                pkg_install_ts[$pkg]=$(stat -f %B "$cellar_dir/$latest" 2>/dev/null || echo 0)
+            fi
+
+            if [[ -d "$cellar_dir/$latest/bin" ]]; then
+                bin_aliases=()
+                for binary in "$cellar_dir/$latest/bin/"*; do
+                    bin_name=$(basename "$binary")
+                    if [[ "$bin_name" != "$pkg" ]]; then
+                        bin_aliases+=("$bin_name")
+                    fi
+                done
+                if [[ ${#bin_aliases[@]} -gt 0 ]]; then
+                    pkg_aliases[$pkg]=$(IFS=','; echo "${bin_aliases[*]}")
                 fi
-            done
-            if [[ ${#bin_aliases[@]} -gt 0 ]]; then
-                pkg_aliases[$pkg]=$(IFS=','; echo "${bin_aliases[*]}")
             fi
         fi
     fi
 done
 
-# ─── Search history using grep (fast) ───────────────────────────────────────
-echo "${DIM}Scanning history...${RESET}" >&2
-NOW=$(date +%s)
+# ─── Get cask packages ──────────────────────────────────────────────────────
+progress "Gathering casks..."
+cask_list=($(brew list --cask 2>/dev/null || true))
+progress "Found ${#cask_list[@]} casks."
+
+declare -A cask_descs
+declare -A cask_install_ts
+declare -A cask_apps
+
+if [[ ${#cask_list[@]} -gt 0 ]]; then
+    progress "Fetching cask info..."
+    while IFS='|' read -r token desc install_time app_names; do
+        cask_descs[$token]="$desc"
+        cask_install_ts[$token]="$install_time"
+        cask_apps[$token]="$app_names"
+    done < <(brew info --json=v2 --cask "${cask_list[@]}" 2>/dev/null \
+        | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for c in d.get('casks', []):
+    apps = []
+    for a in c.get('artifacts', []):
+        if isinstance(a, dict) and 'app' in a:
+            val = a['app']
+            if isinstance(val, list):
+                apps.extend(str(x) for x in val)
+            else:
+                apps.append(str(val))
+    app_str = ','.join(apps)
+    ts = c.get('installed_time', 0) or 0
+    print(c['token'] + '|' + (c.get('desc') or '') + '|' + str(int(ts)) + '|' + app_str)
+")
+fi
+
+# ─── Search history for formulae ────────────────────────────────────────────
+progress "Scanning history..."
 
 declare -a results
 
 for pkg in "${packages[@]}"; do
-    # Build list of search terms: the package name + any binary aliases
     search_terms=("$pkg")
     if [[ -n "${pkg_aliases[$pkg]:-}" ]]; then
         IFS=',' read -ra extra_terms <<< "${pkg_aliases[$pkg]}"
         search_terms+=("${extra_terms[@]}")
     fi
 
-    # Build a grep pattern that matches any term as the invoked command.
-    # Matches after ; (zsh timestamped history), at start of line, or after a pipe.
     patterns=()
     for term in "${search_terms[@]}"; do
         escaped=$(printf '%s' "$term" | sed 's/[.[\*^$()+?{|]/\\&/g')
@@ -162,7 +248,6 @@ for pkg in "${packages[@]}"; do
     done
     grep_pattern=$(IFS='|'; echo "${patterns[*]}")
 
-    # Use grep for the heavy lifting — orders of magnitude faster than shell loops
     matching_lines=$(grep -E "(;|^|\| *)($grep_pattern)( |$)" "$HISTORY_FILE" 2>/dev/null || true)
 
     if [[ -z "$matching_lines" ]]; then
@@ -175,7 +260,6 @@ for pkg in "${packages[@]}"; do
             last_ts=$(echo "$matching_lines" | sed -n 's/^: \([0-9]*\):.*/\1/p' | sort -nr | head -1)
             if [[ -z "$last_ts" ]]; then last_ts=0; fi
         elif [[ "$HISTORY_FORMAT" == "bash" ]]; then
-            # Bash timestamps are on the line before the command (#timestamp)
             last_ts=$(grep -B1 -E "(;|^|\| *)($grep_pattern)( |$)" "$HISTORY_FILE" 2>/dev/null \
                 | sed -n 's/^#\([0-9]*\)$/\1/p' | sort -nr | head -1)
             if [[ -z "$last_ts" ]]; then last_ts=0; fi
@@ -184,10 +268,9 @@ for pkg in "${packages[@]}"; do
         fi
     fi
 
-    # Compute display values
     if (( last_ts > 0 )); then
         days_ago=$(( (NOW - last_ts) / 86400 ))
-        date_str=$(date -r "$last_ts" "+%Y-%m-%d" 2>/dev/null || date -d "@$last_ts" "+%Y-%m-%d" 2>/dev/null || echo "unknown")
+        date_str=$(ts_to_date "$last_ts")
         sort_key=$last_ts
     elif (( count > 0 )); then
         days_ago=-1
@@ -199,39 +282,191 @@ for pkg in "${packages[@]}"; do
         sort_key=0
     fi
 
-    # Apply stale filter
     if (( STALE_DAYS > 0 )); then
         if (( days_ago >= 0 && days_ago < STALE_DAYS )); then
             continue
         fi
     fi
 
+    install_ts="${pkg_install_ts[$pkg]:-0}"
+    if (( install_ts > 0 )); then
+        install_str=$(ts_to_date "$install_ts")
+    else
+        install_str="unknown"
+    fi
+
+    size_kb="${pkg_sizes[$pkg]:-0}"
+    if (( size_kb > 0 )); then
+        size_str=$(format_size "$size_kb")
+    else
+        size_str="—"
+    fi
+
+    service_str="${svc_status[$pkg]:-}"
     alias_str="${pkg_aliases[$pkg]:-}"
     desc_str="${pkg_descs[$pkg]:-}"
-    results+=("${sort_key}|${pkg}|${date_str}|${days_ago}|${count}|${alias_str}|${desc_str}")
+    results+=("${sort_key}|${pkg}|formula|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${service_str}|${alias_str}|${desc_str}")
 done
 
-# Sort by timestamp descending (most recently used first), never-used at the bottom
+# ─── Process casks (macOS metadata + history) ───────────────────────────────
+for cask in "${cask_list[@]}"; do
+    last_ts=0
+    total_size_kb=0
+    app_names="${cask_apps[$cask]:-}"
+
+    # Check .app bundles for last-used date (via macOS Spotlight metadata) and size
+    if [[ -n "$app_names" ]]; then
+        IFS=',' read -ra apps <<< "$app_names"
+        for app in "${apps[@]}"; do
+            for app_dir in "/Applications" "$HOME/Applications"; do
+                app_path="${app_dir}/${app}"
+                if [[ -d "$app_path" ]]; then
+                    mdls_val=$(mdls -raw -name kMDItemLastUsedDate "$app_path" 2>/dev/null || true)
+                    if [[ -n "$mdls_val" && "$mdls_val" != "(null)" ]]; then
+                        mdls_ts=$(date -jf "%Y-%m-%d %H:%M:%S %z" "$mdls_val" "+%s" 2>/dev/null || true)
+                        if [[ -n "$mdls_ts" ]] && (( mdls_ts > last_ts )); then
+                            last_ts=$mdls_ts
+                        fi
+                    fi
+
+                    app_kb=$(du -sk "$app_path" 2>/dev/null | cut -f1)
+                    (( total_size_kb += app_kb )) || true
+                    break
+                fi
+            done
+        done
+    fi
+
+    # Fallback size from Caskroom
+    if (( total_size_kb == 0 )); then
+        caskroom="/opt/homebrew/Caskroom/${cask}"
+        [[ ! -d "$caskroom" ]] && caskroom="/usr/local/Caskroom/${cask}"
+        if [[ -d "$caskroom" ]]; then
+            total_size_kb=$(du -sk "$caskroom" 2>/dev/null | cut -f1)
+        fi
+    fi
+
+    # Also search shell history for cask name and app names
+    search_terms=("$cask")
+    if [[ -n "$app_names" ]]; then
+        IFS=',' read -ra apps <<< "$app_names"
+        for app in "${apps[@]}"; do
+            search_terms+=("${app%.app}")
+        done
+    fi
+
+    patterns=()
+    for term in "${search_terms[@]}"; do
+        escaped=$(printf '%s' "$term" | sed 's/[.[\*^$()+?{|]/\\&/g')
+        patterns+=("$escaped")
+    done
+    grep_pattern=$(IFS='|'; echo "${patterns[*]}")
+
+    matching_lines=$(grep -iE "(;|^|\| *)(open -a *|)($grep_pattern)( |$)" "$HISTORY_FILE" 2>/dev/null || true)
+
+    if [[ -z "$matching_lines" ]]; then
+        count=0
+    else
+        count=$(echo "$matching_lines" | wc -l | tr -d ' ')
+
+        # Try to get timestamp from history if mdls didn't find one
+        if (( last_ts == 0 )); then
+            if [[ "$HISTORY_FORMAT" == "zsh" ]]; then
+                hist_ts=$(echo "$matching_lines" | sed -n 's/^: \([0-9]*\):.*/\1/p' | sort -nr | head -1)
+                if [[ -n "$hist_ts" ]]; then last_ts=$hist_ts; fi
+            elif [[ "$HISTORY_FORMAT" == "bash" ]]; then
+                hist_ts=$(grep -B1 -iE "(;|^|\| *)(open -a *|)($grep_pattern)( |$)" "$HISTORY_FILE" 2>/dev/null \
+                    | sed -n 's/^#\([0-9]*\)$/\1/p' | sort -nr | head -1)
+                if [[ -n "$hist_ts" ]]; then last_ts=$hist_ts; fi
+            fi
+        fi
+    fi
+
+    if (( last_ts > 0 )); then
+        days_ago=$(( (NOW - last_ts) / 86400 ))
+        date_str=$(ts_to_date "$last_ts")
+        sort_key=$last_ts
+    elif (( count > 0 )); then
+        days_ago=-1
+        date_str="no timestamp"
+        sort_key=1
+    else
+        days_ago=-1
+        date_str="never"
+        sort_key=0
+    fi
+
+    if (( STALE_DAYS > 0 )); then
+        if (( days_ago >= 0 && days_ago < STALE_DAYS )); then
+            continue
+        fi
+    fi
+
+    install_ts="${cask_install_ts[$cask]:-0}"
+    if (( install_ts > 0 )); then
+        install_str=$(ts_to_date "$install_ts")
+    else
+        caskroom="/opt/homebrew/Caskroom/${cask}"
+        [[ ! -d "$caskroom" ]] && caskroom="/usr/local/Caskroom/${cask}"
+        if [[ -d "$caskroom" ]]; then
+            fs_ts=$(stat -f %B "$caskroom" 2>/dev/null || echo 0)
+            if (( fs_ts > 0 )); then
+                install_str=$(ts_to_date "$fs_ts")
+            else
+                install_str="unknown"
+            fi
+        else
+            install_str="unknown"
+        fi
+    fi
+
+    if (( total_size_kb > 0 )); then
+        size_str=$(format_size "$total_size_kb")
+    else
+        size_str="—"
+    fi
+
+    alias_str=""
+    if [[ -n "$app_names" ]]; then
+        alias_str="${app_names//.app/}"
+    fi
+
+    service_str="${svc_status[$cask]:-}"
+    desc_str="${cask_descs[$cask]:-}"
+    results+=("${sort_key}|${cask}|cask|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${service_str}|${alias_str}|${desc_str}")
+done
+
+# ─── Sort ────────────────────────────────────────────────────────────────────
 mapfile -t sorted < <(printf '%s\n' "${results[@]}" | sort -t'|' -k1 -nr)
+
+if [[ ${#sorted[@]} -eq 0 ]]; then
+    echo "No packages found."
+    exit 0
+fi
 
 # ─── Output ──────────────────────────────────────────────────────────────────
 if [[ "$CSV_MODE" == true ]]; then
-    echo "package,description,last_used_date,days_ago,times_used,binary_aliases"
+    echo "package,type,description,installed_date,last_used_date,days_ago,times_used,size,service_status,binary_aliases"
     for entry in "${sorted[@]}"; do
-        IFS='|' read -r _ pkg date_str days count bin_aliases desc <<< "$entry"
+        IFS='|' read -r _ pkg type install_str date_str days count size_str service_str bin_aliases desc <<< "$entry"
         if (( days == -1 )); then days=""; fi
-        echo "${pkg},${desc},${date_str},${days},${count},${bin_aliases}"
+        echo "${pkg},${type},${desc},${install_str},${date_str},${days},${count},${size_str},${service_str},${bin_aliases}"
     done
 else
     # Clear progress messages
-    printf "\033[2K\033[A\033[2K\033[A\033[2K\033[A\033[2K\033[A\r" >&2
+    for (( i = 0; i < PROGRESS_LINES; i++ )); do
+        printf "\033[A\033[2K" >&2
+    done
+    printf "\r" >&2
 
     # Header
-    printf "${BOLD}%-25s %-14s %-10s %-8s %-40s %s${RESET}\n" "PACKAGE" "LAST USED" "DAYS AGO" "USES" "DESCRIPTION" "ALIASES"
-    printf "${DIM}%-25s %-14s %-10s %-8s %-40s %s${RESET}\n" "───────" "─────────" "────────" "────" "───────────" "───────"
+    printf "${BOLD}%-25s %-8s %-12s %-14s %-10s %-8s %-8s %-40s %s${RESET}\n" \
+        "PACKAGE" "TYPE" "INSTALLED" "LAST USED" "DAYS AGO" "USES" "SIZE" "DESCRIPTION" "ALIASES"
+    printf "${DIM}%-25s %-8s %-12s %-14s %-10s %-8s %-8s %-40s %s${RESET}\n" \
+        "───────" "────" "─────────" "─────────" "────────" "────" "────" "───────────" "───────"
 
     for entry in "${sorted[@]}"; do
-        IFS='|' read -r _ pkg date_str days count bin_aliases desc <<< "$entry"
+        IFS='|' read -r _ pkg type install_str date_str days count size_str service_str bin_aliases desc <<< "$entry"
 
         # Colour coding
         if [[ "$date_str" == "never" ]]; then
@@ -251,33 +486,50 @@ else
             days_display="${days}d"
         fi
 
+        # Active services are in use even without shell history
+        if [[ "$service_str" == "started" && "$date_str" == "never" ]]; then
+            colour="$GREEN"
+        fi
+
         # Truncate long descriptions
         if (( ${#desc} > 38 )); then
             desc="${desc:0:37}…"
         fi
 
-        alias_display=""
+        # Build trailing info: aliases + service indicator
+        trailing=""
         if [[ -n "$bin_aliases" ]]; then
-            alias_display="${DIM}(${bin_aliases})${RESET}"
+            trailing="${DIM}(${bin_aliases})${RESET}"
+        fi
+        if [[ "$service_str" == "started" ]]; then
+            trailing+=" ${GREEN}● service${RESET}"
+        elif [[ -n "$service_str" && "$service_str" != "none" ]]; then
+            trailing+=" ${DIM}○ service (${service_str})${RESET}"
         fi
 
-        printf "${colour}%-25s %-14s %-10s %-8s${RESET} %-40s %b\n" \
-            "$pkg" "$date_str" "$days_display" "$count" "$desc" "$alias_display"
+        printf "${colour}%-25s %-8s %-12s %-14s %-10s %-8s${RESET} %-8s %-40s %b\n" \
+            "$pkg" "$type" "$install_str" "$date_str" "$days_display" "$count" "$size_str" "$desc" "$trailing"
     done
 
     # Summary
     total=${#sorted[@]}
     never=0
     stale_90=0
+    total_formulae=0
+    total_casks=0
+    total_services=0
     for entry in "${sorted[@]}"; do
-        IFS='|' read -r _ _ date_str days _ _ _ <<< "$entry"
-        if [[ "$date_str" == "never" ]]; then (( never++ )) || true; fi
+        IFS='|' read -r _ _ type _ date_str days _ _ service_str _ _ <<< "$entry"
+        if [[ "$date_str" == "never" && "$service_str" != "started" ]]; then (( never++ )) || true; fi
         if (( days > 90 )); then (( stale_90++ )) || true; fi
+        if [[ "$type" == "formula" ]]; then (( total_formulae++ )) || true; fi
+        if [[ "$type" == "cask" ]]; then (( total_casks++ )) || true; fi
+        if [[ "$service_str" == "started" ]]; then (( total_services++ )) || true; fi
     done
 
     echo ""
-    printf "${DIM}Total: %d packages | ${RED}Never used: %d${RESET}${DIM} | ${YELLOW}Stale (>90d): %d${RESET}\n" \
-        "$total" "$never" "$stale_90"
+    printf "${DIM}Total: %d packages (%d formulae, %d casks) | ${GREEN}Services: %d${RESET}${DIM} | ${RED}Never used: %d${RESET}${DIM} | ${YELLOW}Stale (>90d): %d${RESET}\n" \
+        "$total" "$total_formulae" "$total_casks" "$total_services" "$never" "$stale_90"
 
     if (( never + stale_90 > 0 )); then
         echo ""

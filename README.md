@@ -2,7 +2,7 @@
 
 Find Homebrew packages you never use.
 
-Cross-references `brew leaves` with your shell history (bash or zsh) to show when each package was last used, how many times, and which ones are gathering dust.
+Cross-references `brew leaves` and installed casks with your shell history (bash or zsh) to show when each package was last used, how many times, how much space it takes, and which ones are gathering dust.
 
 ## Install
 
@@ -30,13 +30,19 @@ brew-stale --history ~/alt_history  # use a different history file
 
 ## Output
 
+Each row shows: package name, type (formula/cask), install date, last-used date, days since last use, usage count, and disk size.
+
 Packages are colour-coded by staleness:
 
-- **Green** — used in the last 30 days
+- **Green** — used in the last 30 days, or an active brew service
 - **Yellow** — used 30–90 days ago
 - **Red** — not used in 90+ days, or never
 
-The tool also resolves binary aliases (e.g. `ripgrep` → `rg`) so usage is detected even when the package name doesn't match the command you type.
+### Smart detection
+
+- **Binary aliases** — resolves alternative command names (e.g. `ripgrep` → `rg`) so usage is detected even when the package name doesn't match the command you type
+- **Cask apps** — uses macOS Spotlight metadata (`kMDItemLastUsedDate`) to detect when GUI apps were last opened, even if launched via Finder or Spotlight rather than the terminal
+- **Brew services** — detects packages running as background services (e.g. `watchman`, `postgresql`, `dnsmasq`) and marks them with `● service` so they aren't mistaken for unused packages
 
 ## Requirements
 
