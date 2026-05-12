@@ -43,13 +43,14 @@ else
 fi
 
 # ─── Colours (disabled if not a terminal) ────────────────────────────────────
+# $'...' creates actual escape bytes — works with both echo and printf in bash 3.2
 if [[ -t 1 ]]; then
-    RED='\033[0;31m'
-    YELLOW='\033[0;33m'
-    GREEN='\033[0;32m'
-    DIM='\033[2m'
-    BOLD='\033[1m'
-    RESET='\033[0m'
+    RED=$'\033[0;31m'
+    YELLOW=$'\033[0;33m'
+    GREEN=$'\033[0;32m'
+    DIM=$'\033[2m'
+    BOLD=$'\033[1m'
+    RESET=$'\033[0m'
 else
     RED='' YELLOW='' GREEN='' DIM='' BOLD='' RESET=''
 fi
@@ -469,7 +470,7 @@ else
     printf "${BOLD}%-25s %-8s %-12s %-14s %-10s %-8s %-8s %-40s %s${RESET}\n" \
         "PACKAGE" "TYPE" "INSTALLED" "LAST USED" "DAYS AGO" "USES" "SIZE" "DESCRIPTION" "ALIASES"
     printf "${DIM}%-25s %-8s %-12s %-14s %-10s %-8s %-8s %-40s %s${RESET}\n" \
-        "───────" "────" "─────────" "─────────" "────────" "────" "────" "───────────" "───────"
+        "-------" "----" "---------" "---------" "--------" "----" "----" "-----------" "-------"
 
     for entry in "${sorted[@]}"; do
         IFS='|' read -r _ pkg type install_str date_str days count size_str service_str bin_aliases desc <<< "$entry"
