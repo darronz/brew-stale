@@ -44,10 +44,16 @@ Packages are colour-coded by staleness:
 - **Cask apps** — uses macOS Spotlight metadata (`kMDItemLastUsedDate`) to detect when GUI apps were last opened, even if launched via Finder or Spotlight rather than the terminal
 - **Brew services** — detects packages running as background services (e.g. `watchman`, `postgresql`, `dnsmasq`) and marks them with `● service` so they aren't mistaken for unused packages
 
+## Compatibility
+
+Works with **bash 3.2+** — the version that ships with macOS — so no extra dependencies are needed beyond Homebrew and Python 3. The script avoids bash 4+ features (associative arrays, `mapfile`) to ensure it runs out of the box on a stock Mac.
+
+Reads both **zsh** and **bash** history formats, including timestamped variants. History format is auto-detected; use `--history` to point at a specific file.
+
 ## Requirements
 
 - macOS with [Homebrew](https://brew.sh)
-- bash 4+ or zsh (macOS ships bash 3.2 — run `brew install bash` for a modern version)
+- bash 3.2+ (ships with macOS)
 - Python 3 (for parsing `brew info` JSON)
 
 ## License

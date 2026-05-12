@@ -17,10 +17,16 @@
 
 set -euo pipefail
 
-if ((BASH_VERSINFO[0] < 4)); then
-    echo "Error: bash 4+ required (you have $BASH_VERSION). Install with: brew install bash" >&2
-    exit 1
-fi
+# ─── Compatibility note ─────────────────────────────────────────────────────
+# This script targets bash 3.2+ (the version shipped with macOS) so that it
+# works out of the box without requiring `brew install bash`. Bash 3.2 lacks
+# associative arrays (declare -A) and mapfile, so we use tab-delimited temp
+# files with awk lookups instead of associative arrays, and a while-read loop
+# instead of mapfile.
+
+# ─── Temp storage for metadata (tab-delimited files, bash 3.2 compatible) ───
+_TMPDIR=$(mktemp -d)
+trap 'rm -rf "$_TMPDIR"' EXIT
 
 # ─── Defaults ────────────────────────────────────────────────────────────────
 STALE_DAYS=0
@@ -74,6 +80,11 @@ ts_to_date() {
     date -r "$1" "+%Y-%m-%d" 2>/dev/null || date -d "@$1" "+%Y-%m-%d" 2>/dev/null || echo "unknown"
 }
 
+# Look up a row by key (first column) in a tab-delimited file
+_lookup() {
+    awk -F'\t' -v k="$2" '$1 == k {print; exit}' "$1" 2>/dev/null
+}
+
 # ─── Usage ───────────────────────────────────────────────────────────────────
 usage() {
     cat <<EOF
@@ -124,30 +135,21 @@ fi
 
 NOW=$(date +%s)
 
-# ─── Detect brew services ───────────────────────────────────────────────────
+# ─── Detect brew services → services file (name\tstatus) ────────────────────
 progress "Detecting brew services..."
-declare -A svc_status
-while read -r svc_name svc_state _rest; do
-    [[ "$svc_name" == "Name" ]] && continue
-    [[ -z "$svc_name" ]] && continue
-    svc_status[$svc_name]="$svc_state"
-done < <(brew services list 2>/dev/null || true)
+brew services list 2>/dev/null \
+    | awk 'NR>1 && $1 != "" {print $1 "\t" $2}' \
+    > "$_TMPDIR/services" || true
 
 # ─── Get formula packages ───────────────────────────────────────────────────
 progress "Gathering brew leaves..."
 packages=($(brew leaves))
 progress "Found ${#packages[@]} formulae. Resolving details..."
 
-# ─── Fetch formula info (descriptions + install dates) ──────────────────────
+# ─── Fetch formula info → formula_info file (name\tdesc\tinstall_ts) ────────
 progress "Fetching formula info..."
-declare -A pkg_descs
-declare -A pkg_install_ts
-
 if [[ ${#packages[@]} -gt 0 ]]; then
-    while IFS='|' read -r name desc install_time; do
-        pkg_descs[$name]="$desc"
-        pkg_install_ts[$name]="$install_time"
-    done < <(brew info --json=v2 "${packages[@]}" 2>/dev/null \
+    brew info --json=v2 "${packages[@]}" 2>/dev/null \
         | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -156,61 +158,19 @@ for f in d['formulae']:
     if f.get('installed'):
         times = [i.get('time', 0) or 0 for i in f['installed']]
         ts = max(times) if times else 0
-    print(f['full_name'] + '|' + (f['desc'] or '') + '|' + str(int(ts)))
-")
+    print(f['full_name'] + '\t' + (f['desc'] or '') + '\t' + str(int(ts)))
+" > "$_TMPDIR/formula_info" || true
 fi
-
-# ─── Resolve binary aliases + measure formula sizes ─────────────────────────
-declare -A pkg_aliases
-declare -A pkg_sizes
-
-for pkg in "${packages[@]}"; do
-    cellar_dir="/opt/homebrew/Cellar/${pkg}"
-    if [[ ! -d "$cellar_dir" ]]; then
-        cellar_dir="/usr/local/Cellar/${pkg}"
-    fi
-    if [[ -d "$cellar_dir" ]]; then
-        latest=$(ls -1 "$cellar_dir" 2>/dev/null | tail -1)
-        if [[ -n "$latest" ]]; then
-            pkg_sizes[$pkg]=$(du -sk "$cellar_dir/$latest" 2>/dev/null | cut -f1)
-
-            # Install date fallback from filesystem birth time
-            if [[ "${pkg_install_ts[$pkg]:-0}" == "0" ]]; then
-                pkg_install_ts[$pkg]=$(stat -f %B "$cellar_dir/$latest" 2>/dev/null || echo 0)
-            fi
-
-            if [[ -d "$cellar_dir/$latest/bin" ]]; then
-                bin_aliases=()
-                for binary in "$cellar_dir/$latest/bin/"*; do
-                    bin_name=$(basename "$binary")
-                    if [[ "$bin_name" != "$pkg" ]]; then
-                        bin_aliases+=("$bin_name")
-                    fi
-                done
-                if [[ ${#bin_aliases[@]} -gt 0 ]]; then
-                    pkg_aliases[$pkg]=$(IFS=','; echo "${bin_aliases[*]}")
-                fi
-            fi
-        fi
-    fi
-done
 
 # ─── Get cask packages ──────────────────────────────────────────────────────
 progress "Gathering casks..."
 cask_list=($(brew list --cask 2>/dev/null || true))
 progress "Found ${#cask_list[@]} casks."
 
-declare -A cask_descs
-declare -A cask_install_ts
-declare -A cask_apps
-
+# ─── Fetch cask info → cask_info file (token\tdesc\tinstall_ts\tapp_names) ──
 if [[ ${#cask_list[@]} -gt 0 ]]; then
     progress "Fetching cask info..."
-    while IFS='|' read -r token desc install_time app_names; do
-        cask_descs[$token]="$desc"
-        cask_install_ts[$token]="$install_time"
-        cask_apps[$token]="$app_names"
-    done < <(brew info --json=v2 --cask "${cask_list[@]}" 2>/dev/null \
+    brew info --json=v2 --cask "${cask_list[@]}" 2>/dev/null \
         | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
@@ -225,19 +185,62 @@ for c in d.get('casks', []):
                 apps.append(str(val))
     app_str = ','.join(apps)
     ts = c.get('installed_time', 0) or 0
-    print(c['token'] + '|' + (c.get('desc') or '') + '|' + str(int(ts)) + '|' + app_str)
-")
+    print(c['token'] + '\t' + (c.get('desc') or '') + '\t' + str(int(ts)) + '\t' + app_str)
+" > "$_TMPDIR/cask_info" || true
 fi
 
-# ─── Search history for formulae ────────────────────────────────────────────
+# ─── Process formulae (Cellar + history in one pass) ────────────────────────
 progress "Scanning history..."
 
-declare -a results
+results=()
 
 for pkg in "${packages[@]}"; do
+    # Look up metadata from batch results
+    _row=$(_lookup "$_TMPDIR/formula_info" "$pkg")
+    IFS=$'\t' read -r _key desc json_ts <<< "$_row"
+    desc="${desc:-}"
+    json_ts="${json_ts:-0}"
+
+    svc=$(awk -F'\t' -v k="$pkg" '$1 == k {print $2; exit}' "$_TMPDIR/services" 2>/dev/null)
+
+    # ── Cellar: resolve aliases, size, install date ──
+    aliases_str=""
+    size_kb=0
+    install_ts="$json_ts"
+
+    cellar_dir="/opt/homebrew/Cellar/${pkg}"
+    if [[ ! -d "$cellar_dir" ]]; then
+        cellar_dir="/usr/local/Cellar/${pkg}"
+    fi
+    if [[ -d "$cellar_dir" ]]; then
+        latest=$(ls -1 "$cellar_dir" 2>/dev/null | tail -1)
+        if [[ -n "$latest" ]]; then
+            size_kb=$(du -sk "$cellar_dir/$latest" 2>/dev/null | cut -f1)
+            size_kb="${size_kb:-0}"
+
+            if [[ "$install_ts" == "0" ]]; then
+                install_ts=$(stat -f %B "$cellar_dir/$latest" 2>/dev/null || echo 0)
+            fi
+
+            if [[ -d "$cellar_dir/$latest/bin" ]]; then
+                _aliases=()
+                for binary in "$cellar_dir/$latest/bin/"*; do
+                    bin_name=$(basename "$binary")
+                    if [[ "$bin_name" != "$pkg" ]]; then
+                        _aliases+=("$bin_name")
+                    fi
+                done
+                if [[ ${#_aliases[@]} -gt 0 ]]; then
+                    aliases_str=$(IFS=','; echo "${_aliases[*]}")
+                fi
+            fi
+        fi
+    fi
+
+    # ── History search ──
     search_terms=("$pkg")
-    if [[ -n "${pkg_aliases[$pkg]:-}" ]]; then
-        IFS=',' read -ra extra_terms <<< "${pkg_aliases[$pkg]}"
+    if [[ -n "$aliases_str" ]]; then
+        IFS=',' read -ra extra_terms <<< "$aliases_str"
         search_terms+=("${extra_terms[@]}")
     fi
 
@@ -268,6 +271,7 @@ for pkg in "${packages[@]}"; do
         fi
     fi
 
+    # ── Display values ──
     if (( last_ts > 0 )); then
         days_ago=$(( (NOW - last_ts) / 86400 ))
         date_str=$(ts_to_date "$last_ts")
@@ -288,33 +292,35 @@ for pkg in "${packages[@]}"; do
         fi
     fi
 
-    install_ts="${pkg_install_ts[$pkg]:-0}"
     if (( install_ts > 0 )); then
         install_str=$(ts_to_date "$install_ts")
     else
         install_str="unknown"
     fi
 
-    size_kb="${pkg_sizes[$pkg]:-0}"
     if (( size_kb > 0 )); then
         size_str=$(format_size "$size_kb")
     else
         size_str="—"
     fi
 
-    service_str="${svc_status[$pkg]:-}"
-    alias_str="${pkg_aliases[$pkg]:-}"
-    desc_str="${pkg_descs[$pkg]:-}"
-    results+=("${sort_key}|${pkg}|formula|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${service_str}|${alias_str}|${desc_str}")
+    results+=("${sort_key}|${pkg}|formula|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${svc:-}|${aliases_str}|${desc}")
 done
 
 # ─── Process casks (macOS metadata + history) ───────────────────────────────
 for cask in "${cask_list[@]}"; do
+    _row=$(_lookup "$_TMPDIR/cask_info" "$cask")
+    IFS=$'\t' read -r _key desc install_ts app_names <<< "$_row"
+    desc="${desc:-}"
+    install_ts="${install_ts:-0}"
+    app_names="${app_names:-}"
+
+    svc=$(awk -F'\t' -v k="$cask" '$1 == k {print $2; exit}' "$_TMPDIR/services" 2>/dev/null)
+
     last_ts=0
     total_size_kb=0
-    app_names="${cask_apps[$cask]:-}"
 
-    # Check .app bundles for last-used date (via macOS Spotlight metadata) and size
+    # Check .app bundles for last-used date (Spotlight metadata) and size
     if [[ -n "$app_names" ]]; then
         IFS=',' read -ra apps <<< "$app_names"
         for app in "${apps[@]}"; do
@@ -346,7 +352,7 @@ for cask in "${cask_list[@]}"; do
         fi
     fi
 
-    # Also search shell history for cask name and app names
+    # History search
     search_terms=("$cask")
     if [[ -n "$app_names" ]]; then
         IFS=',' read -ra apps <<< "$app_names"
@@ -369,7 +375,6 @@ for cask in "${cask_list[@]}"; do
     else
         count=$(echo "$matching_lines" | wc -l | tr -d ' ')
 
-        # Try to get timestamp from history if mdls didn't find one
         if (( last_ts == 0 )); then
             if [[ "$HISTORY_FORMAT" == "zsh" ]]; then
                 hist_ts=$(echo "$matching_lines" | sed -n 's/^: \([0-9]*\):.*/\1/p' | sort -nr | head -1)
@@ -402,7 +407,7 @@ for cask in "${cask_list[@]}"; do
         fi
     fi
 
-    install_ts="${cask_install_ts[$cask]:-0}"
+    # Install date with Caskroom filesystem fallback
     if (( install_ts > 0 )); then
         install_str=$(ts_to_date "$install_ts")
     else
@@ -431,13 +436,14 @@ for cask in "${cask_list[@]}"; do
         alias_str="${app_names//.app/}"
     fi
 
-    service_str="${svc_status[$cask]:-}"
-    desc_str="${cask_descs[$cask]:-}"
-    results+=("${sort_key}|${cask}|cask|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${service_str}|${alias_str}|${desc_str}")
+    results+=("${sort_key}|${cask}|cask|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${svc:-}|${alias_str}|${desc}")
 done
 
 # ─── Sort ────────────────────────────────────────────────────────────────────
-mapfile -t sorted < <(printf '%s\n' "${results[@]}" | sort -t'|' -k1 -nr)
+sorted=()
+while IFS= read -r line; do
+    sorted+=("$line")
+done < <(printf '%s\n' "${results[@]}" | sort -t'|' -k1 -nr)
 
 if [[ ${#sorted[@]} -eq 0 ]]; then
     echo "No packages found."
