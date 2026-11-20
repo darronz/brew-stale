@@ -8,6 +8,8 @@
 #   brew-stale              # default output sorted by last used (most recent first)
 #   brew-stale --stale 30   # only show packages not used in the last 30 days
 #   brew-stale --csv        # output as CSV for further processing
+#   brew-stale --sort size  # largest packages first
+#   brew-stale --reverse    # oldest usage first
 #   brew-stale --help       # show usage
 #
 # History format detection:
@@ -31,6 +33,8 @@ trap 'rm -rf "$_TMPDIR"' EXIT
 # ─── Defaults ────────────────────────────────────────────────────────────────
 STALE_DAYS=0
 CSV_MODE=false
+SORT_BY="time"
+REVERSE=false
 
 if [[ -n "${HISTFILE:-}" ]]; then
     HISTORY_FILE="$HISTFILE"
@@ -98,6 +102,8 @@ Also detects brew services and uses macOS metadata for cask app last-used dates.
 Options:
   --stale N    Only show packages not used in the last N days
   --csv        Output as CSV
+  --sort FIELD Sort by time (last used, default) or size, descending
+  --reverse    Reverse sort order (oldest or smallest first)
   --history F  Path to history file (default: \$HISTFILE, ~/.zsh_history, or ~/.bash_history)
   --help       Show this help message
 EOF
@@ -109,6 +115,21 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --stale)  STALE_DAYS="$2"; shift 2 ;;
         --csv)    CSV_MODE=true; shift ;;
+        --sort)
+            if [[ $# -lt 2 ]]; then
+                echo "Error: --sort requires time or size." >&2
+                exit 1
+            fi
+            case "$2" in
+                time|size) SORT_BY="$2" ;;
+                *)
+                    echo "Error: --sort must be time or size." >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
+        --reverse) REVERSE=true; shift ;;
         --history) HISTORY_FILE="$2"; shift 2 ;;
         --help)   usage ;;
         *)        echo "Unknown option: $1"; usage ;;
@@ -305,6 +326,9 @@ for pkg in "${packages[@]}"; do
         size_str="—"
     fi
 
+    if [[ "$SORT_BY" == "size" ]]; then
+        sort_key=$size_kb
+    fi
     results+=("${sort_key}|${pkg}|formula|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${svc:-}|${aliases_str}|${desc}")
 done
 
@@ -437,14 +461,21 @@ for cask in "${cask_list[@]}"; do
         alias_str="${app_names//.app/}"
     fi
 
+    if [[ "$SORT_BY" == "size" ]]; then
+        sort_key=$total_size_kb
+    fi
     results+=("${sort_key}|${cask}|cask|${install_str}|${date_str}|${days_ago}|${count}|${size_str}|${svc:-}|${alias_str}|${desc}")
 done
 
 # ─── Sort ────────────────────────────────────────────────────────────────────
 sorted=()
+sort_args=(-t'|' '-k1,1' -n)
+if [[ "$REVERSE" == false ]]; then
+    sort_args+=(-r)
+fi
 while IFS= read -r line; do
     sorted+=("$line")
-done < <(printf '%s\n' "${results[@]}" | sort -t'|' -k1 -nr)
+done < <(printf '%s\n' "${results[@]}" | sort "${sort_args[@]}")
 
 if [[ ${#sorted[@]} -eq 0 ]]; then
     echo "No packages found."
