@@ -25,8 +25,16 @@ chmod +x brew-stale
 brew-stale                # show all packages, sorted by last used
 brew-stale --stale 30     # only packages not used in the last 30 days
 brew-stale --csv          # CSV output for further processing
+brew-stale --sort size    # largest packages first
+brew-stale --sort size --reverse  # smallest packages first
+brew-stale --sort time --reverse  # oldest usage first
 brew-stale --history ~/alt_history  # use a different history file
 ```
+
+Sorting defaults to `--sort time`, most recently used first, with never-used
+packages last. `--reverse` reverses the order, putting never-used packages first
+when sorting by time. Size sorting uses disk usage, with unknown sizes treated
+as zero. Sorting also applies to `--csv` output and can be combined with `--stale`.
 
 ## Output
 
